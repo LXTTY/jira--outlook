@@ -1,0 +1,1060 @@
+import json
+import logging
+import time
+import threading
+from datetime import datetime
+import win32com.client
+import pythoncom
+import requests
+from requests.auth import HTTPBasicAuth
+import re
+import os
+import uuid
+import shutil
+import mimetypes
+from pathlib import Path
+
+# 配置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('email_to_jira.log', encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+
+def load_config():
+    """加载配置文件"""
+    try:
+        with open('email_to_jira_config.json', 'r', encoding='utf-8') as f:
+            config = json.load(f)
+        logger.info("✅ 配置文件加载成功")
+        return config
+    except FileNotFoundError:
+        logger.error("❌ 配置文件 'email_to_jira_config.json' 未找到")
+        return None
+    except json.JSONDecodeError as e:
+        logger.error(f"❌ 配置文件格式错误: {e}")
+        return None
+
+
+class EmailToJiraHandler:
+    def __init__(self, config):
+        self.config = config
+        self.processed_emails = set()
+        self.stop_event = threading.Event()
+
+        # 指定要监控的邮箱
+        self.target_email = "xingchungui@sylincom.com"
+
+        # 初始化Outlook连接
+        self.outlook = None
+        self.namespace = None
+        self.inbox = None
+
+        # 创建临时福建目录
+        self.temp_dir = Path(self.config['attachments']['temp_dir'])
+        self.temp_dir.mkdir(exist_ok=True)
+        self.load_processed_emails()
+
+    def load_processed_emails(self):
+        """加载已处理的邮件记录"""
+        try:
+            with open('processed_emails.json', 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                self.processed_emails = set(data.get('processed_emails', []))
+            logger.info(f"📋 加载了 {len(self.processed_emails)} 个已处理邮件记录")
+        except FileNotFoundError:
+            logger.info("📋 未找到已处理邮件记录文件，将创建新文件")
+            self.processed_emails = set()
+        except Exception as e:
+            logger.error(f"加载已处理邮件记录失败: {e}")
+            self.processed_emails = set()
+
+    def save_processed_emails(self):
+        """保存已处理的邮件记录"""
+        try:
+            data = {'processed_emails': list(self.processed_emails)}
+            with open('processed_emails.json', 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"保存已处理邮件记录失败: {e}")
+
+    def connect_to_outlook(self):
+        """连接到Outlook并获取指定邮箱"""
+        try:
+            pythoncom.CoInitialize()
+            self.outlook = win32com.client.Dispatch("Outlook.Application")
+            self.namespace = self.outlook.GetNamespace("MAPI")
+
+            logger.info(f"🔍 正在连接到邮箱: {self.target_email}")
+
+            # 方法1：通过共享邮箱方式访问
+            try:
+                recipient = self.namespace.CreateRecipient(self.target_email)
+                recipient.Resolve()
+
+                if recipient.Resolved:
+                    shared_inbox = self.namespace.GetSharedDefaultFolder(recipient, 6)  # 6 = olFolderInbox
+                    self.inbox = shared_inbox
+                    logger.info(f"✅ 成功通过共享邮箱方式连接到: {self.target_email}")
+                    return True
+                else:
+                    logger.warning(f"⚠️ 无法解析邮箱地址: {self.target_email}")
+
+            except Exception as e:
+                logger.warning(f"⚠️ 共享邮箱方式失败: {e}")
+
+            # 方法2：遍历所有账户查找目标邮箱
+            logger.info("🔄 尝试遍历账户查找目标邮箱...")
+            accounts = self.namespace.Accounts
+
+            for i, account in enumerate(accounts):
+                try:
+                    account_email = getattr(account, 'SmtpAddress', '') or getattr(account, 'UserName', '')
+                    display_name = getattr(account, 'DisplayName', f'账户{i + 1}')
+
+                    logger.info(f"  检查账户: {display_name} ({account_email})")
+
+                    if account_email.lower() == self.target_email.lower():
+                        # 找到目标账户
+                        logger.info(f"  ✅ 找到目标账户!")
+
+                        delivery_store = account.DeliveryStore
+                        root_folder = delivery_store.GetRootFolder()
+
+                        # 查找收件箱
+                        for folder in root_folder.Folders:
+                            folder_name = folder.Name.lower()
+                            if folder_name in ['inbox', '收件箱', 'inkomende berichten']:
+                                self.inbox = folder
+                                unread_count = folder.UnReadItemCount
+                                total_count = folder.Items.Count
+                                logger.info(f"✅ 成功连接到收件箱: {folder.Name}")
+                                logger.info(f"📊 邮箱状态 - 未读: {unread_count}, 总计: {total_count}")
+                                return True
+
+                        logger.error(f"❌ 在账户中未找到收件箱文件夹")
+
+                except Exception as e:
+                    logger.warning(f"  检查账户时出错: {e}")
+                    continue
+
+            # 方法3：如果是默认账户，直接使用默认收件箱
+            try:
+                logger.info("🔄 尝试使用默认收件箱...")
+                default_inbox = self.namespace.GetDefaultFolder(6)
+
+                # 检查默认账户的邮箱地址
+                try:
+                    current_user = self.namespace.CurrentUser
+                    if hasattr(current_user, 'Address'):
+                        current_email = current_user.Address
+                        logger.info(f"  默认账户邮箱: {current_email}")
+
+                        if current_email.lower() == self.target_email.lower():
+                            self.inbox = default_inbox
+                            unread_count = default_inbox.UnReadItemCount
+                            total_count = default_inbox.Items.Count
+                            logger.info(f"✅ 使用默认收件箱")
+                            logger.info(f"📊 邮箱状态 - 未读: {unread_count}, 总计: {total_count}")
+                            return True
+                except Exception as e:
+                    logger.warning(f"  检查默认账户失败: {e}")
+
+                # 如果找不到匹配的账户，询问是否使用默认收件箱
+                logger.warning(f"⚠️ 未找到匹配的邮箱账户")
+                logger.info(f"💡 将使用默认收件箱进行监控")
+                self.inbox = default_inbox
+                unread_count = default_inbox.UnReadItemCount
+                total_count = default_inbox.Items.Count
+                logger.info(f"📊 默认收件箱状态 - 未读: {unread_count}, 总计: {total_count}")
+                return True
+
+            except Exception as e:
+                logger.error(f"❌ 访问默认收件箱失败: {e}")
+
+            logger.error(f"❌ 无法连接到任何收件箱")
+            return False
+
+        except Exception as e:
+            logger.error(f"连接Outlook失败: {e}")
+            return False
+
+    def is_target_email(self, mail):
+        """判断是否为目标邮件 - 检查是否以@jira开头"""
+        try:
+            body = mail.Body or ""
+            subject = mail.Subject or ""
+            sender = mail.SenderEmailAddress or ""
+
+            logger.debug(f"    检查邮件:")
+            logger.debug(f"    主题: '{subject}'")
+            logger.debug(f"    发件人: '{sender}'")
+
+            # 检查邮件正文是否以@jira开头
+            body_stripped = body.strip()
+            if body_stripped.lower().startswith('@jira'):
+                logger.info(f"    ✅ 邮件以@jira开头，符合处理条件")
+                return True
+            else:
+                logger.info(f"    ❌ 邮件未以@jira开头，跳过处理")
+                return False
+
+        except Exception as e:
+            logger.error(f"邮件过滤检查异常: {e}")
+            return False
+
+    def scan_unread_emails(self, inbox):
+        """扫描未读邮件"""
+        try:
+            # 获取未读邮件
+            unread_emails = inbox.Items.Restrict("[UnRead] = True")
+            unread_emails.Sort("[ReceivedTime]", True)
+
+            count = unread_emails.Count
+            current_time = datetime.now().strftime("%H:%M:%S")
+
+            # 总是显示扫描状态
+            logger.info(f"[{current_time}] 📧 扫描邮件: 发现 {count} 封未读邮件")
+
+            if count > 0:
+                logger.info(f"开始逐个检查邮件...")
+
+                processed_count = 0
+                for i, mail in enumerate(unread_emails):
+                    if self.stop_event.is_set():
+                        break
+
+                    try:
+                        subject = getattr(mail, 'Subject', '无主题') or '无主题'
+                        sender = getattr(mail, 'SenderEmailAddress', '未知') or '未知'
+
+                        logger.info(f"  邮件 {i + 1}: 主题='{subject[:50]}...' 发件人='{sender}'")
+
+                        # 检查是否为目标邮件（以@jira开头）
+                        is_target = self.is_target_email(mail)
+
+                        if is_target:
+                            if self.process_email(mail):
+                                processed_count += 1
+
+                    except Exception as e:
+                        logger.error(f"  → 处理邮件 {i + 1} 时出错: {e}")
+
+                if processed_count > 0:
+                    logger.info(f"✅ 本次处理了 {processed_count} 封邮件")
+                    self.save_processed_emails()
+                else:
+                    logger.info(f"ℹ️ 没有邮件符合处理条件")
+
+                return processed_count
+            else:
+                # 每5分钟显示一次无邮件状态
+                if hasattr(self, '_last_no_mail_log'):
+                    if (datetime.now() - self._last_no_mail_log).seconds >= 300:
+                        logger.info(f"[{current_time}] 📭 当前无未读邮件")
+                        self._last_no_mail_log = datetime.now()
+                else:
+                    logger.info(f"[{current_time}] 📭 当前无未读邮件")
+                    self._last_no_mail_log = datetime.now()
+                return 0
+
+        except Exception as e:
+            logger.error(f"扫描未读邮件异常: {e}")
+            return 0
+
+    def parse_email_params(self, body):
+        """解析邮件参数并提取有效内容 - 新格式: @jira@项目@经办人@问题类型@完成时间"""
+        project = None
+        assignee = None
+        issue_type = None
+        due_date = None
+        remaining_body = body
+
+        try:
+            # 使用正则表达式匹配新的参数格式：@jira@项目@经办人@问题类型@完成时间
+            pattern = r'^@jira@([^@]*)@([^@]*)@([^@]*)@([^@]*)\s*\n'
+            match = re.match(pattern, body, re.MULTILINE)
+
+            if not match:
+                # 尝试不换行的情况
+                pattern = r'^@jira@([^@]*)@([^@]*)@([^@]*)@([^@]*)'
+                match = re.match(pattern, body)
+
+            if match:
+                project = self.clean_param(match.group(1))
+                assignee = self.clean_param(match.group(2))
+                issue_type = self.clean_param(match.group(3))
+                due_date = self.clean_param(match.group(4))
+
+                # 移除参数行,获取剩余正文
+                remaining_body = body[match.end():].strip()
+
+                logger.info(f"    📋 解析@jira参数成功:")
+                logger.info(f"      项目: {project}")
+                logger.info(f"      经办人: {assignee}")
+                logger.info(f"      问题类型: {issue_type}")
+                logger.info(f"      完成时间: {due_date}")
+            else:
+                logger.warning(f"    ⚠️ 未找到完整的@jira参数格式，使用默认值")
+                # 如果没有找到完整格式，但邮件以@jira开头，移除@jira标记
+                if body.strip().lower().startswith('@jira'):
+                    # 找到第一个换行符或@jira后的内容
+                    lines = body.split('\n')
+                    if len(lines) > 1:
+                        remaining_body = '\n'.join(lines[1:]).strip()
+                    else:
+                        # 如果没有换行，尝试移除@jira
+                        remaining_body = body[5:].strip()  # 移除@jira
+
+            # 从剩余正文中提取##标记内容
+            valid_content = self.extract_content_between_markers(remaining_body)
+
+            logger.info(f"    📝 有效内容长度: {len(valid_content)} 字符")
+
+            return project, assignee, issue_type, due_date, valid_content
+
+        except Exception as e:
+            logger.error(f"解析邮件参数失败: {e}")
+            # 如果解析失败，至少尝试提取##标记内容
+            valid_content = self.extract_content_between_markers(body)
+            return None, None, None, None, valid_content
+
+    def clean_param(self, param):
+        """清理参数，去除空格和换行符"""
+        if param:
+            return param.strip()
+        return None
+
+    def parse_due_date(self, date_str):
+        """
+        解析完成时间为标准格式（用于显示）
+
+        Args:
+            date_str: 时间字符串
+
+        Returns:
+            str: 标准格式的日期字符串 (YYYY-MM-DD) 或 None
+        """
+        if not date_str:
+            return None
+
+        try:
+            # 支持的日期格式
+            date_formats = [
+                '%Y-%m-%d',  # 2025-06-04
+                '%Y/%m/%d',  # 2025/06/04
+                '%Y.%m.%d',  # 2025.06.04
+                '%m/%d/%Y',  # 06/04/2025
+                '%d/%m/%Y',  # 04/06/2025
+                '%Y年%m月%d日',  # 2025年06月04日
+                '%m月%d日',  # 06月04日
+                '%m-%d'  # 06-04
+            ]
+
+            for fmt in date_formats:
+                try:
+                    if fmt == '%m-%d':
+                        # 对于只有月日的格式，使用当前年份
+                        parsed_date = datetime.strptime(date_str, fmt)
+                        current_year = datetime.now().year
+                        parsed_date = parsed_date.replace(year=current_year)
+                    elif fmt == '%m月%d日':
+                        # 对于中文月日格式，使用当前年份
+                        parsed_date = datetime.strptime(date_str, fmt)
+                        current_year = datetime.now().year
+                        parsed_date = parsed_date.replace(year=current_year)
+                    else:
+                        parsed_date = datetime.strptime(date_str, fmt)
+
+                    result = parsed_date.strftime('%Y-%m-%d')
+                    logger.info(f"    ✅ 日期解析成功: {date_str} -> {result}")
+                    return result
+
+                except ValueError:
+                    continue
+
+            logger.warning(f"    ⚠️ 无法解析日期格式: {date_str}，将使用原始格式")
+            return None
+
+        except Exception as e:
+            logger.warning(f"    ⚠️ 日期解析错误: {e}")
+            return None
+
+    def extract_attachments(self, mail):
+        """提取邮件附件"""
+        attachments_info = []
+
+        if not self.config['attachments']['enabled']:
+            return attachments_info
+
+        try:
+            attachment_count = mail.Attachments.Count
+            if attachment_count == 0:
+                return attachments_info
+
+            logger.info(f"    📎 发现 {attachment_count} 个附件")
+
+            # 检查附件数量限制
+            max_count = self.config['attachments']['max_count']
+            if attachment_count > max_count:
+                logger.warning(f"    ⚠️ 附件数量 ({attachment_count}) 超过限制 ({max_count})，只处理前 {max_count} 个")
+                attachment_count = max_count
+
+            # 创建本次邮件的临时目录
+            email_temp_dir = self.temp_dir / str(uuid.uuid4())
+            email_temp_dir.mkdir(exist_ok=True)
+
+            for i in range(1, attachment_count + 1):
+                try:
+                    attachment = mail.Attachments.Item(i)
+                    attachment_info = self.process_single_attachment(attachment, email_temp_dir, i)
+
+                    if attachment_info:
+                        attachments_info.append(attachment_info)
+
+                except Exception as e:
+                    logger.error(f"    ❌ 处理第 {i} 个附件失败: {e}")
+                    continue
+
+            logger.info(f"    ✅ 成功提取 {len(attachments_info)} 个附件")
+
+        except Exception as e:
+            logger.error(f"提取附件异常: {e}")
+
+        return attachments_info
+
+    def process_single_attachment(self, attachment, temp_dir, index):
+        """处理单个附件"""
+        try:
+            filename = attachment.FileName
+            file_size = attachment.Size
+
+            logger.info(f"      📄 处理附件 {index}: {filename} ({self.format_file_size(file_size)})")
+
+            # 检查文件扩展名
+            file_ext = Path(filename).suffix.lower()
+            allowed_extensions = [ext.lower() for ext in self.config['attachments']['allowed_extensions']]
+
+            if file_ext not in allowed_extensions:
+                logger.warning(f"      ⚠️ 跳过不支持的文件类型: {file_ext}")
+                return None
+
+            # 检查文件大小
+            max_size_bytes = self.config['attachments']['max_size_mb'] * 1024 * 1024
+            if file_size > max_size_bytes:
+                logger.warning(
+                    f"      ⚠️ 文件过大，跳过: {self.format_file_size(file_size)} > {self.format_file_size(max_size_bytes)}")
+                return None
+
+            # 生成安全的文件名
+            safe_filename = self.generate_safe_filename(filename)
+            file_path = temp_dir / safe_filename
+
+            # 保存附件
+            attachment.SaveAsFile(str(file_path))
+
+            # 验证文件是否保存成功
+            if not file_path.exists():
+                logger.error(f"      ❌ 附件保存失败: {filename}")
+                return None
+
+            logger.info(f"      ✅ 附件保存成功: {safe_filename}")
+
+            return {
+                'original_name': filename,
+                'safe_name': safe_filename,
+                'file_path': file_path,
+                'size': file_size,
+                'mime_type': mimetypes.guess_type(filename)[0] or 'application/octet-stream'
+            }
+
+        except Exception as e:
+            logger.error(f"      ❌ 处理附件 {filename} 异常: {e}")
+            return None
+
+    def generate_safe_filename(self, filename):
+        """生成安全的文件名"""
+        # 移除危险字符
+        safe_chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-_()[]"
+        safe_name = ''.join(c if c in safe_chars else '_' for c in filename)
+
+        # 如果文件名太长，截断但保留扩展名
+        if len(safe_name) > 100:
+            name_part = Path(safe_name).stem[:90]
+            ext_part = Path(safe_name).suffix
+            safe_name = name_part + ext_part
+
+        # 添加时间戳避免冲突
+        timestamp = int(time.time())
+        name_part = Path(safe_name).stem
+        ext_part = Path(safe_name).suffix
+
+        return f"{name_part}_{timestamp}{ext_part}"
+
+    def format_file_size(self, size_bytes):
+        """格式化文件大小"""
+        if size_bytes < 1024:
+            return f"{size_bytes} B"
+        elif size_bytes < 1024 * 1024:
+            return f"{size_bytes / 1024:.1f} KB"
+        else:
+            return f"{size_bytes / (1024 * 1024):.1f} MB"
+
+    def upload_attachments_to_jira(self, issue_key, attachments_info):
+        """上传附件到Jira"""
+        if not attachments_info:
+            return True
+
+        try:
+            base_url = f"{self.config['jira']['base_url']}/rest/api/2/issue/{issue_key}/attachments"
+            auth = HTTPBasicAuth(
+                self.config['jira']['username'],
+                self.config['jira']['password']
+            )
+
+            logger.info(f"    📤 开始上传 {len(attachments_info)} 个附件到 {issue_key}")
+
+            success_count = 0
+
+            for i, attachment_info in enumerate(attachments_info, 1):
+                try:
+                    logger.info(f"      🔄 上传附件 {i}/{len(attachments_info)}: {attachment_info['original_name']}")
+
+                    # 准备文件上传
+                    with open(attachment_info['file_path'], 'rb') as file:
+                        files = {
+                            'file': (
+                                attachment_info['original_name'],
+                                file,
+                                attachment_info['mime_type']
+                            )
+                        }
+
+                        headers = {
+                            'X-Atlassian-Token': 'no-check'  # Jira要求的CSRF保护
+                        }
+
+                        response = requests.post(
+                            base_url,
+                            files=files,
+                            auth=auth,
+                            headers=headers
+                        )
+
+                        if response.status_code == 200:
+                            logger.info(f"      ✅ 附件上传成功: {attachment_info['original_name']}")
+                            success_count += 1
+                        else:
+                            logger.error(f"      ❌ 附件上传失败: {response.status_code}")
+                            logger.error(f"      响应内容: {response.text}")
+
+                except Exception as e:
+                    logger.error(f"      ❌ 上传附件 {attachment_info['original_name']} 异常: {e}")
+                    continue
+
+            logger.info(f"    📊 附件上传完成: {success_count}/{len(attachments_info)} 成功")
+            return success_count > 0
+
+        except Exception as e:
+            logger.error(f"上传附件到Jira异常: {e}")
+            return False
+
+    def cleanup_attachments(self, attachments_info):
+        """清理临时附件文件"""
+        try:
+            if not attachments_info:
+                return
+
+            # 获取临时目录（所有附件应该在同一个临时目录中）
+            temp_dirs = set()
+            for attachment_info in attachments_info:
+                temp_dirs.add(attachment_info['file_path'].parent)
+
+            # 删除临时目录
+            for temp_dir in temp_dirs:
+                if temp_dir.exists():
+                    shutil.rmtree(temp_dir)
+                    logger.debug(f"    🗑️ 已清理临时目录: {temp_dir}")
+
+        except Exception as e:
+            logger.error(f"清理附件文件异常: {e}")
+
+    def create_jira_issue_with_attachments(self, subject, sender, body, received_time, mail,
+                                           project=None, assignee=None, issue_type=None, due_date=None):
+        """创建Jira缺陷并上传附件 - 支持动态参数"""
+        try:
+            # 1. 提取附件
+            attachments_info = self.extract_attachments(mail)
+
+            # 2. 构建描述（包含附件信息和参数信息）
+            description = self.build_issue_description(subject=subject, sender=sender, body=body, received_time=received_time, attachments_info=attachments_info,
+                                                       project=project, assignee=assignee, issue_type=issue_type, due_date=due_date)
+
+            # 3. 创建Jira问题
+            issue_key = self.create_jira_issue_only(subject, description, project, assignee, issue_type, due_date)
+
+            if not issue_key:
+                # 创建失败，清理附件
+                self.cleanup_attachments(attachments_info)
+                return False
+
+            # 4. 上传附件
+            upload_success = True
+            if attachments_info:
+                upload_success = self.upload_attachments_to_jira(issue_key, attachments_info)
+
+            # 5. 清理临时文件
+            self.cleanup_attachments(attachments_info)
+
+            # 6. 显示结果
+            issue_base_url = f"{self.config['jira']['base_url']}/browse/{issue_key}"
+            logger.info(f"    🔗 缺陷链接: {issue_base_url}")
+
+            if attachments_info and upload_success:
+                logger.info(f"    📎 附件上传完成")
+            elif attachments_info and not upload_success:
+                logger.warning(f"    ⚠️ 缺陷创建成功，但部分附件上传失败")
+
+            return True
+
+        except Exception as e:
+            logger.error(f"创建Jira缺陷异常: {e}")
+            return False
+
+    def build_issue_description(self, subject, sender, body, received_time, attachments_info,
+                                project=None, assignee=None, issue_type=None, due_date=None):
+        """构建问题描述 - 提取有效内容并格式化"""
+        try:
+            logger.info(f"🔍 开始构建描述...")
+            logger.info(f"    📧 原始body长度: {len(body) if body else 0}")
+            logger.info(f"    📧 原始body内容: {repr(body[:200]) if body else 'None'}...")
+
+            # 调用extract_connect_between_markers提取##标记之间的有效内容
+            valid_content = self.extract_content_between_markers(body)
+            logger.info(f"    📝 有效内容长度: {len(valid_content) if valid_content else 0}")
+            logger.info(f"    📝 有效内容: {repr(valid_content[:200]) if valid_content else 'None'}...")
+
+            description_parts = []
+
+            # 添加完成时间（如果有）
+            if due_date:
+                parsed_due_date = self.parse_due_date(due_date)
+                if parsed_due_date:
+                    description_parts.append(f"📅 完成时间: {parsed_due_date}")
+                    logger.info(f"    ✅ 完成时间已添加: {parsed_due_date}")
+                else:
+                    description_parts.append(f"📅 完成时间: {due_date}")
+                    logger.info(f"    ✅ 完成时间已添加(原始): {due_date}")
+                description_parts.append("")  # 添加空行
+
+            # 添加有效内容
+            if valid_content and valid_content.strip():
+                description_parts.append(valid_content.strip())
+                logger.info(f"    ✅ 有效内容已添加")
+            else:
+                description_parts.append("内容为空或无##标记内容")
+                logger.warning(f"    ⚠️ 有效内容为空，使用默认文本")
+
+            # 如果有附件，添加附件信息
+            if attachments_info:
+                description_parts.append("")  # 添加空行
+                description_parts.append("*附件信息:*")
+                for attachment in attachments_info:
+                    try:
+                        filename = attachment.get('original_name', '未知文件名')
+                        size = attachment.get('size', 0)
+                        formatted_size = self.format_file_size(size)
+                        description_parts.append(f"• {filename} ({formatted_size})")
+                    except Exception as e:
+                        logger.warning(f"访问附件信息失败: {e}")
+                        description_parts.append(f"• 附件信息读取失败")
+
+            final_description = "\n".join(description_parts)
+
+            logger.info(f"🔍 最终描述长度: {len(final_description)} 字符")
+            logger.info(f"📝 最终描述完整内容: {repr(final_description)}")
+
+            return final_description
+
+        except Exception as e:
+            logger.error(f"构建问题描述时发生异常: {e}")
+            import traceback
+            logger.error(f"详细错误信息: {traceback.format_exc()}")
+
+            # 返回简化的描述
+            fallback_description = f"邮件内容处理异常: {str(e)}"
+            if due_date:
+                fallback_description = f"📅 完成时间: {due_date}\n\n{fallback_description}"
+
+            logger.info(f"📝 使用备用描述: {repr(fallback_description)}")
+            return fallback_description
+
+    def extract_content_between_markers(self, content):
+        """
+        提取##标记之间的有效内容
+        """
+        import re
+
+        if not content:
+            logger.warning("    ⚠️ 内容为空")
+            return "内容为空"
+
+        logger.info(f"    🔍 开始提取##标记内容...")
+        logger.info(f"    📄 待处理内容前200字符: {content[:200]}")
+
+        # 匹配 ##任意内容## 格式，支持多行
+        pattern = r'##(.*?)##'
+        matches = re.findall(pattern, content, re.DOTALL)
+
+        if matches:
+            # 合并所有匹配的内容
+            valid_content = '\n\n'.join(match.strip() for match in matches if match.strip())
+            logger.info(f"    ✅ 成功提取##标记内容: {len(valid_content)} 字符")
+            logger.info(f"    📝 提取内容: {valid_content}")
+            return valid_content
+        else:
+            logger.warning(f"    ⚠️ 未找到##标记，返回原内容")
+            logger.info(f"    📄 原内容: {content}")
+            return content  # 如果没有##标记，返回原内容
+
+    def create_jira_issue_only(self, subject, description, project=None, assignee=None, issue_type=None, due_date=None):
+        """仅创建Jira问题 - 包含所有必填字段"""
+        try:
+            # 使用传入的参数或配置文件中的默认值
+            final_project = project or self.config['jira']['project']
+            final_issue_type_id = self.config['jira'].get('issue_type_id', '10004')
+            final_description = self.extract_content_between_markers(description)
+            
+            # 获取当前时间作为预计开始时间
+            from datetime import datetime, timedelta
+            start_date = datetime.now().strftime('%Y-%m-%d')
+
+            # 计算预计完成时间（默认7天后，或使用due_date）
+            if due_date:
+                end_date = self.parse_due_date(due_date) or due_date
+            else:
+                end_date = (datetime.now() + timedelta(days=7)).strftime('%Y-%m-%d')
+
+            # 构建issue数据 - 包含所有必填字段
+            issue_data = {
+                'fields': {
+                    # 基本必填字段
+                    'project': {'key': final_project},  # 项目
+                    'summary': subject,  # 概要
+                    'description': final_description,  # 描述
+                    'issuetype': {'id': final_issue_type_id},  # 问题类型
+
+                    # 时间相关字段
+                    'customfield_10127': start_date,  # 预计开始时间
+                    'customfield_10128': end_date,  # 预计完成时间
+                    'customfield_10403': self.config['jira'].get('default_completion_criteria', '问题解决并验证通过'),
+                    # 完成指标
+
+                    # 新增的必填字段
+                    'customfield_10414': self.config['jira'].get('default_department', 'IT部门'),  # 所属部门
+                    'customfield_10417': self.config['jira'].get('default_module', '系统维护'),  # 问题模块
+                    'customfield_10418': self.config['jira'].get('default_category', '缺陷修复'),  # 问题类别
+                }
+            }
+
+            # 如果指定了经办人
+            if assignee:
+                issue_data['fields']['assignee'] = {'name': assignee}
+
+            logger.info(f"🚀 准备创建Jira问题:")
+            logger.info(f"   项目: {final_project}")
+            logger.info(f"   标题: {subject}")
+            logger.info(f"   问题类型ID: {final_issue_type_id}")
+            logger.info(f"   经办人: {assignee}")
+            logger.info(f"   预计开始时间: {start_date}")
+            logger.info(f"   预计完成时间: {end_date}")
+            logger.info(f"   完成指标: {issue_data['fields']['customfield_10403']}")
+            logger.info(f"   所属部门: {issue_data['fields']['customfield_10414']}")
+            logger.info(f"   问题模块: {issue_data['fields']['customfield_10417']}")
+            logger.info(f"   问题类别: {issue_data['fields']['customfield_10418']}")
+
+            # 创建问题
+            response = requests.post(
+                f"{self.config['jira']['base_url']}/rest/api/2/issue",
+                json=issue_data,
+                auth=(self.config['jira']['username'], self.config['jira']['password']),
+                headers={'Content-Type': 'application/json'}
+            )
+
+            if response.status_code == 201:
+                issue_key = response.json()['key']
+                issue_url = f"{self.config['jira']['base_url']}/browse/{issue_key}"
+                logger.info(f"✅ Jira问题创建成功!")
+                logger.info(f"   问题编号: {issue_key}")
+                logger.info(f"   访问链接: {issue_url}")
+                return issue_key
+            else:
+                logger.error(f"❌ 创建Jira缺陷失败: {response.status_code}")
+                logger.error(f"响应内容: {response.text}")
+
+                # 解析错误信息，显示缺少的字段
+                try:
+                    error_data = response.json()
+                    if 'errors' in error_data:
+                        logger.error("缺少的必填字段:")
+                        for field, message in error_data['errors'].items():
+                            logger.error(f"  - {field}: {message}")
+                except:
+                    pass
+
+                return None
+
+        except Exception as e:
+            logger.error(f"创建Jira缺陷异常: {e}")
+            import traceback
+            logger.error(f"详细错误: {traceback.format_exc()}")
+            return None
+
+    def get_start_date(self):
+        """获取预计开始时间（默认为今天）"""
+        from datetime import datetime
+        return datetime.now().strftime('%Y-%m-%d')
+
+    def get_end_date(self, due_date=None):
+        """获取预计完成时间"""
+        if due_date:
+            # 如果提供了截止日期，使用它
+            parsed_date = self.parse_due_date(due_date)
+            return parsed_date if parsed_date else due_date
+        else:
+            # 默认设置为7天后
+            from datetime import datetime, timedelta
+            return (datetime.now() + timedelta(days=7)).strftime('%Y-%m-%d')
+
+    def process_email(self, mail):
+        """处理邮件 - 支持@jira参数解析"""
+        try:
+            subject = mail.Subject or "无主题"
+            sender = mail.SenderEmailAddress
+            body = mail.Body or ""
+            received_time = mail.ReceivedTime.strftime("%Y-%m-%d %H:%M:%S")
+
+            logger.info(f"  📧 处理邮件: {subject}")
+            logger.info(f"    👤 发件人: {sender}")
+            logger.info(f"    🕒 时间: {received_time}")
+
+            # 解析@jira邮件参数
+            project, assignee, issue_type, due_date, valid_content = self.parse_email_params(body)
+
+            # 创建Jira缺陷并处理附件（传入解析的参数）
+            success = self.create_jira_issue_with_attachments(
+                subject, sender, valid_content, received_time, mail,
+                project=project, assignee=assignee, issue_type=issue_type, due_date=due_date
+            )
+
+            if success:
+                # 标记为已读
+                if self.config.get('mark_as_read', True):
+                    mail.UnRead = False
+                    logger.info(f"    ✅ 邮件已标记为已读")
+
+                return True
+            else:
+                logger.error(f"    ❌ 处理邮件失败")
+                return False
+
+        except Exception as e:
+            logger.error(f"处理邮件异常: {e}")
+            return False
+
+    def __del__(self):
+        """析构函数 - 清理临时目录"""
+        try:
+            if hasattr(self, 'temp_dir') and self.temp_dir.exists():
+                shutil.rmtree(self.temp_dir, ignore_errors=True)
+        except:
+            pass
+
+    def test_jira_connection(self):
+        """测试Jira连接"""
+        try:
+            base_url = f"{self.config['jira']['base_url']}/rest/api/2/myself"
+            auth = HTTPBasicAuth(
+                self.config['jira']['username'],
+                self.config['jira']['password']
+            )
+
+            response = requests.get(base_url, auth=auth)
+
+            if response.status_code == 200:
+                user_info = response.json()
+                logger.info(f"✅ Jira连接成功，当前用户: {user_info.get('displayName', 'Unknown')}")
+
+                # 验证项目访问权限
+                project_base_url = f"{self.config['jira']['base_url']}/rest/api/2/project/{self.config['jira']['project']}"
+                project_response = requests.get(project_base_url, auth=auth)
+
+                if project_response.status_code == 200:
+                    project_info = project_response.json()
+                    logger.info(
+                        f"✅ 项目 {self.config['jira']['project']} 连接成功: {project_info.get('name', 'Unknown')}")
+                    return True
+                else:
+                    logger.error(f"❌ 无法访问项目 {self.config['jira']['project']}: {project_response.status_code}")
+                    return False
+            else:
+                logger.error(f"❌ Jira连接失败: {response.status_code}")
+                return False
+
+        except Exception as e:
+            logger.error(f"测试Jira连接异常: {e}")
+            return False
+
+    def test_outlook_connection(self):
+        """测试Outlook连接"""
+        return self.connect_to_outlook()
+
+    def start_monitoring(self):
+        """启动邮件监控"""
+        self.run_monitor()
+
+    def stop_monitoring(self):
+        """停止邮件监控"""
+        self.stop_event.set()
+
+    def run_monitor(self):
+        """运行邮件监控"""
+        if not self.connect_to_outlook():
+            logger.error("无法连接到Outlook，程序退出")
+            return
+
+        if not self.inbox:
+            logger.error("无法获取收件箱，程序退出")
+            return
+
+        logger.info(f"📧 开始监控邮箱: {self.target_email}")
+        logger.info(f"⏰ 检查间隔: {self.config['monitor']['check_interval']}秒")
+        logger.info(f"🎯 触发条件: 邮件以@jira开头")
+        logger.info("🔄 监控已启动，等待邮件...")
+
+        # 显示@jira参数解析功能状态
+        logger.info("📋 支持邮件参数格式: @jira@项目@经办人@问题类型@完成时间")
+        logger.info("💡 示例: @jira@S702@张三@缺陷@2024-12-31")
+        logger.info("📝 内容格式: ##实际问题描述内容##")
+
+        while not self.stop_event.is_set():
+            try:
+                processed_count = self.scan_unread_emails(self.inbox)
+
+                if processed_count > 0:
+                    logger.info(f"✅ 本轮处理了 {processed_count} 封邮件")
+
+                # 等待指定间隔
+                self.stop_event.wait(self.config['monitor']['check_interval'])
+
+            except KeyboardInterrupt:
+                logger.info("收到停止信号，正在退出...")
+                break
+            except Exception as e:
+                logger.error(f"监控过程中发生异常: {e}")
+                self.stop_event.wait(10)  # 异常后等待10秒再继续
+
+
+def main():
+    try:
+        # 加载配置
+        config = load_config()
+        if not config:
+            logger.error("❌ 无法加载配置文件，程序退出")
+            return
+
+        # 创建处理器
+        handler = EmailToJiraHandler(config)
+
+        # 测试连接
+        if not handler.test_outlook_connection():
+            logger.error("❌ Outlook连接失败，程序退出")
+            return
+
+        if not handler.test_jira_connection():
+            logger.error("❌ Jira连接失败，程序退出")
+            return
+
+        logger.info("🎯 开始监控邮件...")
+        logger.info(f"📧 目标邮箱: {handler.target_email}")
+        logger.info(f"🔍 触发条件: 邮件内容以@jira开头")
+        logger.info(f"📎 附件支持: {'启用' if config['attachments']['enabled'] else '禁用'}")
+
+        if config['attachments']['enabled']:
+            logger.info(f"📁 临时目录: {config['attachments']['temp_dir']}")
+            logger.info(f"📏 大小限制: {config['attachments']['max_size_mb']} MB")
+            logger.info(f"🔢 数量限制: {config['attachments']['max_count']} 个")
+
+        # 开始监控
+        handler.start_monitoring()
+
+    except KeyboardInterrupt:
+        logger.info("\n👋 收到退出信号，正在停止...")
+    except Exception as e:
+        logger.error(f"程序异常: {e}")
+    finally:
+        if 'handler' in locals():
+            handler.stop_monitoring()
+        logger.info("🔚 程序已退出")
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+email_to_jira_config.json文件修改：
+{
+  "jira": {
+    "base_url": "https://your-jira-instance.com",
+    "username": "your-username",
+    "password": "your-password",
+    "project": "PROJECT_KEY",
+    "issue_type_id": "10004",
+    "default_completion_criteria": "问题解决并验证通过",
+    "default_department": "IT部门",
+    "default_module": "系统维护",
+    "default_category": "缺陷修复"
+  },
+  "monitor": {
+    "check_interval": 30
+  },
+  "attachments": {
+    "enabled": true,
+    "temp_dir": "temp_attachments",
+    "max_size_mb": 500,
+    "max_count": 5,
+    "allowed_extensions": [".jpg", ".png", ".pdf", ".docx", ".xlsx", ".txt", ".log"]
+  },
+  "mark_as_read": true
+}
+
